@@ -8,13 +8,14 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 
 class WosCrawler:
-    def __init__(self, efficiency=1, once_want=None, headless=True):
-        self.total_address = 0
+    def __init__(self, target_field='WC', efficiency=1, once_want=None, headless=True):
+        self.total_target = 0
         self.total_url = 0
         self.total_crawled = 0
         self.total_not_found = 0
         self.headless = headless
         self.driver = self.init_driver(headless=headless)
+        self.field = target_field # 爬取目标字段，如 AD（机构），OG（研究领域），WC（学科类别）
         self.efficiency = efficiency # 控制爬取速度，sep_time = time / efficiency
         self.once_want = once_want # 每次想要爬取的数量，None表示全部爬取
 
@@ -57,15 +58,14 @@ class WosCrawler:
         """
         尝试获取所有需爬取机构的信息
         table: infos
-        school | address | url | result_count | page_count | crawled_or_not
-        1. school: 机构名称
-        2. address: 机构地址
-        3. url: 机构对应的 WOS 地址
-        4. result_count: 该机构的结果总数
-        5. page_count: 该机构的结果总页数
-        6. crawled_or_not: 是否已爬取，0 未爬取，1 已爬取，2 无结果
+        target | url | result_count | page_count | crawled_or_not
+        1. target: 目标
+        2. url: 对应的 WOS 地址
+        3. result_count: 该机构的结果总数
+        4. page_count: 该机构的结果总页数
+        5. crawled_or_not: 是否已爬取，0 未爬取，1 已爬取，2 无结果
         """
-        if self.check_info():
+        if not self.check_info():
             print("All institutions have been crawled.")
             return []
         else:
@@ -73,7 +73,7 @@ class WosCrawler:
                 conn = sqlite3.connect('data.db')
                 cursor = conn.cursor()
                 cursor.execute('''
-                    SELECT school, address, url, result_count, page_count 
+                    SELECT target, url, result_count, page_count 
                     FROM infos WHERE crawled_or_not = 0;
                 ''')
                 results = cursor.fetchall()
@@ -87,19 +87,14 @@ class WosCrawler:
     def check_info(self):
         """
         检查infos情况:
-        各school的address数量，其中url存在占比，其中crawled_or_not=1占比
-        汇总address数量，url存在数量，crawled_or_not=1数量
+        汇总target数量，url存在数量，crawled_or_not=1数量
         """
         try:
             conn = sqlite3.connect('data.db')
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT school, COUNT(address) AS address_count,
-                    SUM(CASE WHEN url IS NOT NULL THEN 1 ELSE 0 END) AS url_count,
-                    SUM(CASE WHEN crawled_or_not = 1 THEN 1 ELSE 0 END) AS crawled_count,
-                    SUM(CASE WHEN crawled_or_not = 2 THEN 1 ELSE 0 END) AS not_found_count
-                FROM infos
-                GROUP BY school
+                SELECT target, url, result_count, page_count, crawled_or_not
+                FROM infos WHERE crawled_or_not = 0;
             ''')
             results = cursor.fetchall()
         except Exception as e:
@@ -109,17 +104,12 @@ class WosCrawler:
             conn.close()
 
         for row in results:
-            print(f"{row[0]}, Address: {row[1]}, URL: {row[2]}, Crawled: {row[3]}/{row[1]}, Not Found: {row[4]}/{row[1]}")
-            self.total_address += row[1]
-            self.total_url += row[2]
-            self.total_crawled += row[3]
-            self.total_not_found += row[4]
-        print(f"Total, Address: {self.total_address}, URL: {self.total_url}, Crawled: {self.total_crawled}, Not Found: {self.total_not_found}")
+            print(f"target: {row[0]}, URL: {row[1]}, Status: {row[4]}")
 
-        return self.total_address == self.total_crawled
+        return self.total_target == self.total_crawled
 
-    def crawl_address(self, school, address):
-        if self.search_address(address):
+    def crawl_target(self, target):
+        if self.search_target(target):
             return True
         # 等待结果加载
         WebDriverWait(self.driver, 10).until(
@@ -133,14 +123,14 @@ class WosCrawler:
         
         # 超大量结果处理
         if result_count >= 100000:
-            print(f"{address} Results {result_count} exceed")
-            return self.crawl_address_large(school, address, result_count=result_count, page_count=page_count, base_url=base_url)
+            print(f"{target} Results {result_count} exceed")
+            return self.crawl_target_large(target, result_count=result_count, page_count=page_count, base_url=base_url)
         else:
-            print(f"{address} Results {result_count}")
+            print(f"{target} Results {result_count}")
 
         crawled_count = 0
         # 断点续爬
-        crawled_page_count = self.continue_crawl(school, address)
+        crawled_page_count = self.continue_crawl(target)
         if crawled_page_count:
             self.to_page(crawled_page_count + 1)
         else:
@@ -149,7 +139,7 @@ class WosCrawler:
         for i in range(1, page_count + 1):
             if crawled_page_count and i <= crawled_page_count:
                 crawled_count += 50
-                print(f"{address}:\t{i}/{page_count}-{crawled_count}/{result_count} (continued)")
+                print(f"{target}:\t{i}/{page_count}-{crawled_count}/{result_count} (continued)")
             else:
                 WebDriverWait(self.driver, 10).until(
                     EC.presence_of_element_located(
@@ -157,38 +147,38 @@ class WosCrawler:
                     )
                 )
                 # crawl
-                page_data = self.crawl_page(address)
-                crawled_count_plus = self.save_data(page_data, school)
+                page_data = self.crawl_page(target)
+                crawled_count_plus = self.save_data(target, page_data)
                 if not crawled_count_plus: # 保存失败，如冲突
                     if i > 1:
                         self.to_page(i) # 回到当前页重试
                     self.driver.refresh()
                     time.sleep(2 / self.efficiency)
-                    page_data = self.crawl_page(address)
-                    crawled_count_plus = self.save_data(page_data, school)
+                    page_data = self.crawl_page(target)
+                    crawled_count_plus = self.save_data(target, page_data)
                 if not crawled_count_plus:
                     self.restart_driver(headless=self.headless)
-                    self.search_address(address)
+                    self.search_target(target)
                     if i > 1:
                         self.to_page(i)
                     time.sleep(2 / self.efficiency)
-                    page_data = self.crawl_page(address)
-                    crawled_count_plus = self.save_data(page_data, school)
+                    page_data = self.crawl_page(target)
+                    crawled_count_plus = self.save_data(target, page_data)
                 if not crawled_count_plus:
-                    print(f"{address} Failed saving data on page {i}")
-                    crawled_count_plus = self.save_data_single(page_data, school)
+                    print(f"{target} Failed saving data on page {i}")
+                    crawled_count_plus = self.save_data_single(target, page_data)
                 crawled_count += crawled_count_plus
-                print(f"{address}:\t{i}/{page_count}-{crawled_count}/{result_count}")
+                print(f"{target}:\t{i}/{page_count}-{crawled_count}/{result_count}")
                 self.next_page()
         if result_count <= page_count * 50:
-            self.set_crawled(address, url=base_url, result_count=result_count, page_count=page_count)
-            print(f"{address} Successed")
+            self.set_crawled(target, url=base_url, result_count=result_count, page_count=page_count)
+            print(f"{target} Successed")
             return True
         else:
-            print(f"{address} Failed")
+            print(f"{target} Failed")
             return False
     
-    def crawl_address_large(self, school, address, result_count, page_count, base_url):
+    def crawl_target_large(self, target, result_count, page_count, base_url):
         # //div[@data-ta="filter-section-PY"]//button[@data-ta="see-all"]
         # //ul[@class="refine-options"]
         # //ul[@class="refine-options"]//li
@@ -241,10 +231,10 @@ class WosCrawler:
 
         # show all years
         self.driver.find_element(By.XPATH, '//div[@data-ta="filter-section-PY"]//button[@data-ta="see-all"]').click()
-        if not os.path.exists(f'{address.replace(" ", "_")}.db'):
+        if not os.path.exists(f'{target.replace(" ", "_")}.db'):
             try:
                 # 临时数据库
-                conn = sqlite3.connect(f'{address.replace(" ", "_")}.db')
+                conn = sqlite3.connect(f'{target.replace(" ", "_")}.db')
                 cursor = conn.cursor()
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS YP (
@@ -273,22 +263,22 @@ class WosCrawler:
                     conn.commit()
             except Exception as e:
                 conn.rollback()
-                print(f"{address} Failed")
+                print(f"{target} Failed")
                 print("Error creating db:", e)
                 return False
             finally:
                 conn.close()
         try:
-            conn = sqlite3.connect(f'{address.replace(" ", "_")}.db')
+            conn = sqlite3.connect(f'{target.replace(" ", "_")}.db')
             cursor = conn.cursor()
             # 读取待爬年份
             cursor.execute('SELECT id, year, year_result_count, crawled_page_count FROM YP WHERE crawled_or_not = 0')
             rows = cursor.fetchall()
-            print(f"{address} Remain Years: {len(rows)}")
+            print(f"{target} Remain Years: {len(rows)}")
             # 逐年爬取
             for row in rows:
                 year_id, year, year_result_count, crawled_page_count = row
-                print(f"{year}-{address}")
+                print(f"{year}-{target}")
                 # 选择年份
                 select_year(year_id)
                 # 等待结果加载
@@ -304,7 +294,7 @@ class WosCrawler:
                 for i in range(1, year_page_count + 1):
                     if crawled_page_count and i <= crawled_page_count:
                         crawled_count += 50
-                        print(f"{year}-{address}:\t{i}/{year_page_count}-{crawled_count}/{year_result_count} (continued)")
+                        print(f"{year}-{target}:\t{i}/{year_page_count}-{crawled_count}/{year_result_count} (continued)")
                     else:
                         WebDriverWait(self.driver, 10).until(
                             EC.presence_of_element_located(
@@ -312,52 +302,52 @@ class WosCrawler:
                             )
                         )
                         # crawl
-                        page_data = self.crawl_page(address)
-                        crawled_count_plus = self.save_data(page_data, school)
+                        page_data = self.crawl_page(target)
+                        crawled_count_plus = self.save_data(target, page_data)
                         if not crawled_count_plus: # 保存失败，如冲突
                             if i > 1:
                                 self.to_page(i) # 回到当前页重试
                             self.driver.refresh()
                             time.sleep(2 / self.efficiency)
-                            page_data = self.crawl_page(address)
-                            crawled_count_plus = self.save_data(page_data, school)
+                            page_data = self.crawl_page(target)
+                            crawled_count_plus = self.save_data(target, page_data)
                         if not crawled_count_plus:
                             self.restart_driver(headless=self.headless)
-                            self.search_address(address)
+                            self.search_target(target)
                             select_year(year_id)
                             if i > 1:
                                 self.to_page(i)
                             time.sleep(2 / self.efficiency)
-                            page_data = self.crawl_page(address)
-                            crawled_count_plus = self.save_data(page_data, school)
+                            page_data = self.crawl_page(target)
+                            crawled_count_plus = self.save_data(target, page_data)
                         if not crawled_count_plus:
-                            print(f"{year}-{address} Failed saving data on page {i}")
-                            crawled_count_plus = self.save_data_single(page_data, school)
+                            print(f"{year}-{target} Failed saving data on page {i}")
+                            crawled_count_plus = self.save_data_single(target, page_data)
                         crawled_count += crawled_count_plus
-                        print(f"{year}-{address}:\t{i}/{year_page_count}-{crawled_count}/{year_result_count}")
+                        print(f"{year}-{target}:\t{i}/{year_page_count}-{crawled_count}/{year_result_count}")
                         self.next_page()
                 if year_result_count <= year_page_count * 50:
                     cursor.execute('''
                         UPDATE YP SET crawled_or_not = 1, year_page_count = ?, crawled_page_count = ? WHERE year = ?;
                     ''', (year_page_count, i, year))
                     conn.commit()
-                    print(f"{year}-{address} Successed")
+                    print(f"{year}-{target} Successed")
                 else:
-                    print(f"{year}-{address} Failed")
-            self.set_crawled(address, url=base_url, result_count=result_count, page_count=page_count)
+                    print(f"{year}-{target} Failed")
+            self.set_crawled(target, url=base_url, result_count=result_count, page_count=page_count)
             return True
         except Exception as e:
             cursor.execute('''
                 UPDATE YP SET crawled_or_not = 0, year_page_count = ?, crawled_page_count = ? WHERE year = ?;
             ''', (year_page_count, i - 1, year))
             conn.commit()
-            print(f"{year}-{address} Failed")
-            print("Error in crawl_address_large:")
+            print(f"{year}-{target} Failed")
+            print("Error in crawl_target_large:")
             raise e
         finally:
             conn.close()
 
-    def search_address(self, address):
+    def search_target(self, target):
         self.driver.get("https://webofscience.clarivate.cn/wos/woscc/advanced-search")
         time.sleep(1 / self.efficiency)
         self.accept_cookies()
@@ -366,17 +356,17 @@ class WosCrawler:
             EC.presence_of_element_located((By.XPATH, "//textarea"))
         )
         # 构建检索式
-        AD = f"AD=({address})"
+        query = f"{self.field}=({target})"
         search_box = self.driver.find_element(By.XPATH, "//textarea")
         search_box.clear()
-        search_box.send_keys(AD)
+        search_box.send_keys(query)
         # 点击检索
         search_button = self.driver.find_element(By.XPATH, "//div[@class='upper-search-preview-holder']//div[@class='button-row adv ng-star-inserted']//button[@mat-ripple-loader-class-name='mat-mdc-button-ripple'][2]")
         search_button.click()
         time.sleep(1 / self.efficiency)
         if not self.check_search_results():
-            print(f"{address} No results found.")
-            self.set_crawled(address, url='', result_count=0, page_count=0, crawled_or_not=2)
+            print(f"{target} No results found.")
+            self.set_crawled(target, url='', result_count=0, page_count=0, crawled_or_not=2)
             return True
 
     def check_search_results(self):
@@ -391,13 +381,13 @@ class WosCrawler:
         except TimeoutException:
             return True
 
-    def set_crawled(self, address, url=None, result_count=None, page_count=None, crawled_or_not=1):
+    def set_crawled(self, target, url=None, result_count=None, page_count=None, crawled_or_not=1):
         try:
             conn = sqlite3.connect('data.db')
             cursor = conn.cursor()
             cursor.execute('''
-                UPDATE infos SET crawled_or_not = ?, url = ?, result_count = ?, page_count = ? WHERE address = ?;
-            ''', (crawled_or_not, url, result_count, page_count, address))
+                UPDATE infos SET crawled_or_not = ?, url = ?, result_count = ?, page_count = ? WHERE target = ?;
+            ''', (crawled_or_not, url, result_count, page_count, target))
             conn.commit()
         except Exception as e:
             conn.rollback()
@@ -405,7 +395,7 @@ class WosCrawler:
         finally:
             conn.close()
 
-    def crawl_page(self, address):
+    def crawl_page(self, target):
         # Extract data from the page
         data = []  # Placeholder for extracted data
         base_xpath = "//app-records-list/app-record"
@@ -517,16 +507,16 @@ class WosCrawler:
                             abstract += '\n' + para
             except:
                 abstract = None
-            data.append((address, title, authors, pub_date, conference, source, citations, refs, wos_id, abstract))
+            data.append((target, title, authors, pub_date, conference, source, citations, refs, wos_id, abstract))
         return data
 
-    def save_data(self, data, school):
+    def save_data(self, target, data):
         try:
             conn = sqlite3.connect('data.db')
             cursor = conn.cursor()
             cursor.executemany('''
-                INSERT INTO {} (address, title, authors, pub_date, conference, source, citations, refs, wos_id, abstract) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-            '''.format(school), data)
+                INSERT INTO {} (target, title, authors, pub_date, conference, source, citations, refs, wos_id, abstract) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            '''.format(target.replace(' ', '_').replace(',', '_').replace('&', '_')), data)
             conn.commit()
             return len(data)
         except Exception as e:
@@ -536,7 +526,7 @@ class WosCrawler:
         finally:
             conn.close()
     
-    def save_data_single(self, data_batch, school):
+    def save_data_single(self, target, data_batch):
         crawled_count = 0
         try:
             conn = sqlite3.connect('data.db')
@@ -544,8 +534,8 @@ class WosCrawler:
             for data in data_batch:
                 try:
                     cursor.execute('''
-                        INSERT INTO {} (address, title, authors, pub_date, conference, source, citations, refs, wos_id, abstract) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                    '''.format(school), data)
+                        INSERT INTO {} (target, title, authors, pub_date, conference, source, citations, refs, wos_id, abstract) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    '''.format(target.replace(' ', '_').replace(',', '_').replace('&', '_')), data)
                     conn.commit()
                     crawled_count += 1
                 except Exception as e:
@@ -598,15 +588,15 @@ class WosCrawler:
         except TimeoutException:
             print("No cookies prompt")
 
-    def continue_crawl(self, school, address):
+    def continue_crawl(self, target):
         """断点续爬"""
         # 统计已有数据量
         try:
             conn = sqlite3.connect('data.db')
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT COUNT(*) FROM {} WHERE address = ?;
-            '''.format(school), (address,))
+                SELECT COUNT(*) FROM {} WHERE target = ?;
+            '''.format(target.replace(' ', '_').replace(',', '_').replace('&', '_')), (target,))
             existing_count = cursor.fetchone()[0]
         except Exception as e:
             print("Error fetching existing count:", e)
@@ -628,8 +618,8 @@ class WosCrawler:
                 return True
             count = 0
             for info in infos:
-                school, address, _, _, _ = info
-                success = self.crawl_address(school, address)
+                target = info[0]
+                success = self.crawl_target(target)
                 if success:
                     count += 1
                     time.sleep(5 / self.efficiency)
@@ -645,7 +635,7 @@ if __name__ == "__main__":
     # crawler.crawl()
     while True:
         try:
-            crawler = WosCrawler(efficiency=1, once_want=None, headless=True)
+            crawler = WosCrawler(target_field='WC', efficiency=1, once_want=None, headless=True)
             if crawler.crawl():
                 print("All done!")
                 break
